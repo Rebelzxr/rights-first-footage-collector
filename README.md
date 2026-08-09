@@ -19,12 +19,14 @@ Most automated video tools optimize for filling a timeline. This project optimiz
 - Optional catalog-first lookup.
 - Creator, source-page, provider-ID and licence receipts.
 - Minimum 1920×1080 landscape and four-second duration gate.
-- Streaming downloads with HTTPS host allowlists and size limits.
+- Streaming downloads with pre-contact redirect allowlists and size limits.
 - SHA-256 duplicate checks.
 - Three-frame perceptual dHash checks with a configurable Hamming threshold.
 - Start, middle and end review frames.
 - Contact-sheet generation.
-- Private 24-hour API cache.
+- Private API cache with a mandatory 24-hour minimum for Pixabay.
+- A hard cap on network download attempts, including rejected files.
+- Automatic removal of rejected media and review frames.
 - Atomic mode-600 manifests, receipts and cache files on POSIX.
 - No social-media scraping and no automatic production approval.
 
@@ -89,19 +91,19 @@ runtime/cathedral-candidates/
 └── frames/
 ```
 
-Every external file stays `CANDIDATE_NEEDS_REVIEW`. The collector never writes to the supplied catalog.
+Every accepted external file stays `CANDIDATE_NEEDS_REVIEW`. The collector never writes to the supplied catalog. `--max-downloads` caps network attempts, not merely accepted files; rejected media and its frames are removed.
 
 ## Security model
 
 - API keys are read from process environment variables or a mode-600 env file.
 - Download URLs and secret-shaped fields are excluded from manifests.
 - Errors remove URLs and secret-like values.
-- API and download hosts are allowlisted and must use HTTPS.
-- Redirect destinations are checked again.
+- API and download hosts are matched on exact domains or dot-delimited subdomains and must use HTTPS.
+- Every redirect target is checked before contact, and authorization headers are stripped across origins.
 - Downloads are streamed into partial files with a hard size limit, then moved atomically.
 - Output, cache and receipt files use private POSIX permissions.
 
-Provider API responses are cached privately and can contain temporary download URLs. Protect the cache directory and do not publish it.
+Provider API responses are cached privately and can contain temporary download URLs. Protect the cache directory and do not publish it. Pixabay cache entries are retained for at least 24 hours even if a lower CLI value is requested.
 
 See [SECURITY.md](SECURITY.md) for reporting vulnerabilities.
 

@@ -16,6 +16,8 @@ Collect candidates, not an unreviewed media dump.
 - Treat every external download as `CANDIDATE_NEEDS_REVIEW`.
 - Never modify the production catalog automatically.
 - Reject missing rights fields, invalid media, duplicate source IDs, duplicate files, and perceptually similar footage.
+- Cap network download attempts, including failed and rejected candidates.
+- Remove rejected media and review frames from the output directory.
 - Inspect the contact sheet and provider source pages before accepting any candidate.
 
 ## Requirements
@@ -51,7 +53,7 @@ Environment variables override values in `--env-file`. On POSIX, the supplied en
 - `clips/*.mp4`
 - `frames/*-{start,middle,end}.jpg`
 
-The manifest omits provider download URLs and secret-shaped fields. The private API cache may contain provider responses and uses mode-600 files under `~/.cache/rights-first-footage-collector` unless `--cache-dir` is supplied.
+The manifest omits provider download URLs and secret-shaped fields. Receipt paths are relative to the output directory. The private API cache may contain provider responses and uses mode-600 files under `~/.cache/rights-first-footage-collector` unless `--cache-dir` is supplied. Pixabay always uses a cache TTL of at least 24 hours.
 
 ## Review workflow
 

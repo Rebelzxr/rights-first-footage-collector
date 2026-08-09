@@ -4,6 +4,7 @@ import importlib.util
 import json
 import os
 import stat
+import subprocess
 import sys
 import tempfile
 import time
@@ -65,6 +66,14 @@ class CollectorTests(unittest.TestCase):
         self.assertNotIn("abc123", message)
         self.assertNotIn("https://", message)
         self.assertIn("[REDACTED]", message)
+        subprocess_message = MODULE.safe_error(
+            subprocess.CalledProcessError(
+                1, ["/" + "Users" + "/example/private/ffmpeg"]
+            )
+        )
+        self.assertEqual(
+            subprocess_message, "media command failed: CalledProcessError"
+        )
 
     def test_safe_http_error_omits_url(self) -> None:
         error = urllib.error.HTTPError(
@@ -88,6 +97,53 @@ class CollectorTests(unittest.TestCase):
         ):
             with self.assertRaises(MODULE.CollectorError):
                 MODULE.validate_https_url(url, (".pexels.com",))
+        self.assertEqual(
+            MODULE.validate_https_url("https://pixabay.com/api/", ("pixabay.com",)),
+            "https://pixabay.com/api/",
+        )
+        with self.assertRaises(MODULE.CollectorError):
+            MODULE.validate_https_url(
+                "https://evilpixabay.com/api/", ("pixabay.com",)
+            )
+
+    def test_redirect_handler_blocks_before_contact_and_strips_authorization(self) -> None:
+        handler = MODULE.AllowlistedRedirectHandler(MODULE.API_HOSTS)
+        request = MODULE.urllib.request.Request(
+            "https://api.pexels.com/v1/videos/search",
+            headers={"Authorization": "secret"},
+        )
+        redirected = handler.redirect_request(
+            request,
+            None,
+            302,
+            "Found",
+            {},
+            "https://pixabay.com/api/videos/",
+        )
+        self.assertIsNotNone(redirected)
+        self.assertIsNone(redirected.get_header("Authorization"))
+        relative = handler.redirect_request(
+            request,
+            None,
+            302,
+            "Found",
+            {},
+            "/v1/videos/next",
+        )
+        self.assertIsNotNone(relative)
+        self.assertEqual(
+            relative.full_url, "https://api.pexels.com/v1/videos/next"
+        )
+        self.assertEqual(relative.get_header("Authorization"), "secret")
+        with self.assertRaises(MODULE.CollectorError):
+            handler.redirect_request(
+                request,
+                None,
+                302,
+                "Found",
+                {},
+                "https://evilpixabay.com/steal",
+            )
 
     def test_cache_key_contains_no_api_key_input(self) -> None:
         value = MODULE.cache_key("pixabay", "stone arch", 1, 3)
@@ -100,7 +156,10 @@ class CollectorTests(unittest.TestCase):
             key = MODULE.cache_key("pexels", "temple", 1, 3)
             cache_path = cache_dir / f"{key}.json"
             cache_path.write_text('{"videos": []}', encoding="utf-8")
-            stats = MODULE.CacheStats()
+            stats = MODULE.CacheStats(
+                rate_limit_remaining={"pexels": 0},
+                rate_limit_reset={"pexels": "tomorrow"},
+            )
             payload = MODULE.request_json(
                 provider="pexels",
                 url="https://api.pexels.com/v1/videos/search?query=temple",
@@ -115,6 +174,107 @@ class CollectorTests(unittest.TestCase):
             self.assertEqual(payload, {"videos": []})
             self.assertEqual(stats.hits, 1)
             self.assertEqual(stats.misses, 0)
+
+    def test_provider_source_ids_are_safe_filename_components(self) -> None:
+        components = [
+            MODULE.safe_source_component(value)
+            for value in ("../../../../escape", r"..\..\escape", "a/b", "normal-42")
+        ]
+        for component in components:
+            self.assertNotIn("/", component)
+            self.assertNotIn("\\", component)
+            self.assertNotIn("..", component)
+        self.assertEqual(len(set(components)), len(components))
+
+    def test_output_target_must_remain_inside_root(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder) / "output"
+            root.mkdir()
+            safe = root / "clips" / "clip.mp4"
+            self.assertEqual(MODULE.ensure_within_root(safe, root), safe)
+            with self.assertRaisesRegex(MODULE.CollectorError, "escapes"):
+                MODULE.ensure_within_root(root.parent / "escape.mp4", root)
+
+    @unittest.skipUnless(os.name == "posix", "POSIX permission and symlink test")
+    def test_symlinked_output_directory_does_not_mutate_external_target(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            output = root / "output"
+            external = root / "external"
+            output.mkdir()
+            external.mkdir()
+            external.chmod(0o755)
+            (output / "clips").symlink_to(external, target_is_directory=True)
+
+            with self.assertRaisesRegex(MODULE.CollectorError, "symlinked"):
+                MODULE.ensure_private_subdirectory(output / "clips", output)
+
+            self.assertEqual(stat.S_IMODE(external.stat().st_mode), 0o755)
+            self.assertEqual(list(external.iterdir()), [])
+
+    @unittest.skipUnless(os.name == "posix", "POSIX permission and symlink test")
+    def test_symlinked_top_level_output_is_rejected_without_external_writes(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            external = root / "external"
+            external.mkdir()
+            external.chmod(0o755)
+            output_link = root / "output-link"
+            output_link.symlink_to(external, target_is_directory=True)
+            args = Namespace(
+                query=["stone arch"],
+                provider="pexels",
+                out=output_link,
+                env_file=None,
+                catalog=None,
+                cache_dir=root / "cache",
+                cache_ttl_hours=24,
+                limit_per_query=1,
+                max_downloads=1,
+                max_file_mb=10,
+                page_start=1,
+                dhash_threshold=6,
+                download=False,
+                force_external=False,
+            )
+
+            with self.assertRaisesRegex(MODULE.CollectorError, "symlinked"):
+                MODULE.run(args)
+
+            self.assertEqual(stat.S_IMODE(external.stat().st_mode), 0o755)
+            self.assertEqual(list(external.iterdir()), [])
+
+    @unittest.skipUnless(os.name == "posix", "POSIX permission and symlink test")
+    def test_symlinked_cache_directory_is_rejected_without_external_writes(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            external = root / "external-cache"
+            external.mkdir()
+            external.chmod(0o755)
+            cache_link = root / "cache-link"
+            cache_link.symlink_to(external, target_is_directory=True)
+            args = Namespace(
+                query=["stone arch"],
+                provider="pexels",
+                out=root / "output",
+                env_file=None,
+                catalog=None,
+                cache_dir=cache_link,
+                cache_ttl_hours=24,
+                limit_per_query=1,
+                max_downloads=1,
+                max_file_mb=10,
+                page_start=1,
+                dhash_threshold=6,
+                download=False,
+                force_external=False,
+            )
+
+            with self.assertRaisesRegex(MODULE.CollectorError, "symlinked"):
+                MODULE.run(args)
+
+            self.assertEqual(stat.S_IMODE(external.stat().st_mode), 0o755)
+            self.assertEqual(list(external.iterdir()), [])
 
     def test_expired_cache_is_not_fresh(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
@@ -148,6 +308,54 @@ class CollectorTests(unittest.TestCase):
             ]
         )
         self.assertEqual(selected["link"], "uhd")
+
+    def test_pixabay_accepts_root_source_page_and_rejects_missing_rights(self) -> None:
+        valid_payload = {
+            "hits": [
+                {
+                    "id": 9,
+                    "pageURL": "https://pixabay.com/videos/cathedral-9/",
+                    "user": "Creator",
+                    "duration": 12,
+                    "videos": {
+                        "large": {
+                            "url": "https://cdn.pixabay.com/video/9.mp4",
+                            "width": 1920,
+                            "height": 1080,
+                        }
+                    },
+                }
+            ]
+        }
+        original = MODULE.request_json
+        MODULE.request_json = lambda **_kwargs: valid_payload
+        try:
+            rows = MODULE.pixabay_search(
+                "cathedral", 1, 1, "secret", Path("."), 24, MODULE.CacheStats()
+            )
+        finally:
+            MODULE.request_json = original
+        self.assertEqual(rows[0]["source_page"], "https://pixabay.com/videos/cathedral-9/")
+
+        invalid_payload = {
+            "hits": [
+                {
+                    "id": None,
+                    "pageURL": "https://pixabay.com/videos/cathedral-9/",
+                    "user": None,
+                    "duration": 12,
+                    "videos": valid_payload["hits"][0]["videos"],
+                }
+            ]
+        }
+        MODULE.request_json = lambda **_kwargs: invalid_payload
+        try:
+            rows = MODULE.pixabay_search(
+                "cathedral", 1, 1, "secret", Path("."), 24, MODULE.CacheStats()
+            )
+        finally:
+            MODULE.request_json = original
+        self.assertEqual(rows, [])
 
     def test_hamming_distance_and_near_duplicate_threshold(self) -> None:
         self.assertEqual(MODULE.hamming_distance("0", "f"), 4)
@@ -201,6 +409,235 @@ class CollectorTests(unittest.TestCase):
             if os.name == "posix":
                 self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
 
+    def test_pixabay_enforces_24_hour_cache_minimum(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            observed: list[int] = []
+            original_search = MODULE.pixabay_search
+            old_key = os.environ.get("PIXABAY_API_KEY")
+
+            def fake_search(
+                _query, _page, _limit, _key, _cache_dir, cache_ttl_hours, _stats
+            ):
+                observed.append(cache_ttl_hours)
+                return []
+
+            MODULE.pixabay_search = fake_search
+            os.environ["PIXABAY_API_KEY"] = "test-key"
+            try:
+                args = Namespace(
+                    query=["stone arch"],
+                    provider="pixabay",
+                    out=root / "out",
+                    env_file=None,
+                    catalog=None,
+                    cache_dir=root / "cache",
+                    cache_ttl_hours=1,
+                    limit_per_query=1,
+                    max_downloads=1,
+                    max_file_mb=10,
+                    page_start=1,
+                    dhash_threshold=6,
+                    download=False,
+                    force_external=False,
+                )
+                receipt = MODULE.run(args)
+            finally:
+                MODULE.pixabay_search = original_search
+                if old_key is None:
+                    os.environ.pop("PIXABAY_API_KEY", None)
+                else:
+                    os.environ["PIXABAY_API_KEY"] = old_key
+            self.assertEqual(observed, [24])
+            self.assertEqual(receipt["cache_ttl_hours"], 24)
+
+    def test_pixabay_rejects_queries_over_100_characters_before_search(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            called = False
+            original_search = MODULE.pixabay_search
+            old_key = os.environ.get("PIXABAY_API_KEY")
+
+            def fake_search(*_args):
+                nonlocal called
+                called = True
+                return []
+
+            MODULE.pixabay_search = fake_search
+            os.environ["PIXABAY_API_KEY"] = "test-key"
+            try:
+                args = Namespace(
+                    query=["a" * 101],
+                    provider="pixabay",
+                    out=root / "out",
+                    env_file=None,
+                    catalog=None,
+                    cache_dir=root / "cache",
+                    cache_ttl_hours=24,
+                    limit_per_query=1,
+                    max_downloads=1,
+                    max_file_mb=10,
+                    page_start=1,
+                    dhash_threshold=6,
+                    download=False,
+                    force_external=False,
+                )
+                with self.assertRaisesRegex(MODULE.CollectorError, "100 characters"):
+                    MODULE.run(args)
+            finally:
+                MODULE.pixabay_search = original_search
+                if old_key is None:
+                    os.environ.pop("PIXABAY_API_KEY", None)
+                else:
+                    os.environ["PIXABAY_API_KEY"] = old_key
+            self.assertFalse(called)
+
+    def test_untrusted_source_id_cannot_escape_download_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            captured: list[tuple[Path, Path]] = []
+            personal_root = "/" + "Users" + "/example/private"
+            original_search = MODULE.pexels_search
+            original_download = MODULE.download
+            old_key = os.environ.get("PEXELS_API_KEY")
+
+            def fake_search(*_args):
+                return [
+                    {
+                        "provider": "pexels",
+                        "source_id": "../../../../escape",
+                        "source_page": "https://www.pexels.com/video/1/",
+                        "creator": "Creator",
+                        "_download_url": "https://videos.pexels.com/1.mp4",
+                        "api_width": 1920,
+                        "api_height": 1080,
+                        "api_duration_sec": 8.0,
+                    }
+                ]
+
+            def fake_download(_url, path, _provider, _max_bytes, output_root):
+                captured.append((path, output_root))
+                MODULE.ensure_within_root(path, output_root)
+                raise OSError(13, "Permission denied", personal_root + "/frame.jpg")
+
+            MODULE.pexels_search = fake_search
+            MODULE.download = fake_download
+            os.environ["PEXELS_API_KEY"] = "test-key"
+            try:
+                args = Namespace(
+                    query=["stone arch"],
+                    provider="pexels",
+                    out=root / "out",
+                    env_file=None,
+                    catalog=None,
+                    cache_dir=root / "cache",
+                    cache_ttl_hours=24,
+                    limit_per_query=1,
+                    max_downloads=1,
+                    max_file_mb=10,
+                    page_start=1,
+                    dhash_threshold=6,
+                    download=True,
+                    force_external=False,
+                )
+                MODULE.run(args)
+            finally:
+                MODULE.pexels_search = original_search
+                MODULE.download = original_download
+                if old_key is None:
+                    os.environ.pop("PEXELS_API_KEY", None)
+                else:
+                    os.environ["PEXELS_API_KEY"] = old_key
+            self.assertEqual(len(captured), 1)
+            path, output_root = captured[0]
+            self.assertEqual(path.parent, output_root / "clips")
+            self.assertNotIn("/", path.name)
+            self.assertNotIn("\\", path.name)
+            self.assertNotIn("..", path.name)
+            manifest = (root / "out" / "candidate_manifest.jsonl").read_text(
+                encoding="utf-8"
+            )
+            self.assertNotIn(personal_root, manifest)
+            self.assertIn("filesystem operation failed: PermissionError", manifest)
+
+    def test_download_cap_counts_failed_attempts(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            attempts: list[str] = []
+            original_search = MODULE.pexels_search
+            original_download = MODULE.download
+            old_key = os.environ.get("PEXELS_API_KEY")
+
+            def fake_search(*_args):
+                return [
+                    {
+                        "provider": "pexels",
+                        "source_id": str(index),
+                        "source_page": f"https://www.pexels.com/video/{index}/",
+                        "creator": f"Creator {index}",
+                        "_download_url": f"https://videos.pexels.com/{index}.mp4",
+                        "api_width": 1920,
+                        "api_height": 1080,
+                        "api_duration_sec": 8.0,
+                    }
+                    for index in range(1, 4)
+                ]
+
+            def fake_download(url, *_args):
+                attempts.append(url)
+                raise MODULE.CollectorError("simulated failure")
+
+            MODULE.pexels_search = fake_search
+            MODULE.download = fake_download
+            os.environ["PEXELS_API_KEY"] = "test-key"
+            try:
+                args = Namespace(
+                    query=["stone arch"],
+                    provider="pexels",
+                    out=root / "out",
+                    env_file=None,
+                    catalog=None,
+                    cache_dir=root / "cache",
+                    cache_ttl_hours=24,
+                    limit_per_query=3,
+                    max_downloads=2,
+                    max_file_mb=10,
+                    page_start=1,
+                    dhash_threshold=6,
+                    download=True,
+                    force_external=False,
+                )
+                receipt = MODULE.run(args)
+            finally:
+                MODULE.pexels_search = original_search
+                MODULE.download = original_download
+                if old_key is None:
+                    os.environ.pop("PEXELS_API_KEY", None)
+                else:
+                    os.environ["PEXELS_API_KEY"] = old_key
+            self.assertEqual(len(attempts), 2)
+            self.assertEqual(receipt["download_attempts"], 2)
+            self.assertEqual(receipt["downloaded"], 0)
+
+    def test_rate_limit_exhaustion_stops_before_network(self) -> None:
+        stats = MODULE.CacheStats(
+            rate_limit_remaining={"pexels": 0},
+            rate_limit_reset={"pexels": "tomorrow"},
+        )
+        with tempfile.TemporaryDirectory() as folder:
+            with self.assertRaisesRegex(MODULE.CollectorError, "rate limit exhausted"):
+                MODULE.request_json(
+                    provider="pexels",
+                    url="https://api.pexels.com/v1/videos/search?query=arch",
+                    headers={"Authorization": "secret"},
+                    cache_dir=Path(folder),
+                    cache_ttl_hours=24,
+                    query="arch",
+                    page=1,
+                    limit=1,
+                    stats=stats,
+                )
+
     def test_catalog_only_run_needs_no_api_key_and_persists_no_secret(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
@@ -240,6 +677,8 @@ class CollectorTests(unittest.TestCase):
             output = (root / "out" / "RUN_RECEIPT.json").read_text(encoding="utf-8")
             self.assertNotIn("API_KEY", output)
             self.assertFalse(receipt["download_urls_in_manifest"])
+            self.assertEqual(receipt["manifest"], "candidate_manifest.jsonl")
+            self.assertIsNone(receipt["contact_sheet"])
 
 
 if __name__ == "__main__":

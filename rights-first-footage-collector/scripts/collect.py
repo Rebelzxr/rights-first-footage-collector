@@ -16,7 +16,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
@@ -51,6 +51,41 @@ class CollectorError(RuntimeError):
 class CacheStats:
     hits: int = 0
     misses: int = 0
+    rate_limit_remaining: dict[str, int] = field(default_factory=dict)
+    rate_limit_reset: dict[str, str] = field(default_factory=dict)
+
+
+class AllowlistedRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Validate redirects before contact and strip credentials across origins."""
+
+    def __init__(self, allowed_hosts: Iterable[str]):
+        super().__init__()
+        self.allowed_hosts = tuple(allowed_hosts)
+
+    def redirect_request(
+        self,
+        request: urllib.request.Request,
+        file_pointer: Any,
+        code: int,
+        message: str,
+        headers: Any,
+        new_url: str,
+    ) -> urllib.request.Request | None:
+        absolute_url = urllib.parse.urljoin(request.full_url, new_url)
+        validate_https_url(absolute_url, self.allowed_hosts)
+        redirected = super().redirect_request(
+            request, file_pointer, code, message, headers, absolute_url
+        )
+        if redirected is None:
+            return None
+        old_host = (urllib.parse.urlsplit(request.full_url).hostname or "").lower()
+        new_host = (urllib.parse.urlsplit(absolute_url).hostname or "").lower()
+        if old_host != new_host:
+            for name in ("Authorization", "Proxy-Authorization"):
+                redirected.remove_header(name)
+                redirected.headers.pop(name, None)
+                redirected.unredirected_hdrs.pop(name, None)
+        return redirected
 
 
 def utc_now() -> str:
@@ -60,6 +95,12 @@ def utc_now() -> str:
 def slugify(value: str) -> str:
     slug = re.sub(r"[^a-z0-9]+", "-", value.lower()).strip("-")
     return slug[:72] or "footage"
+
+
+def safe_source_component(value: str) -> str:
+    readable = slugify(value)[:40]
+    digest = hashlib.sha256(value.encode("utf-8")).hexdigest()[:12]
+    return f"{readable}-{digest}"
 
 
 def validate_query(value: str) -> str:
@@ -102,6 +143,10 @@ def safe_error(error: BaseException) -> str:
         return f"provider request failed with HTTP {error.code}"
     if isinstance(error, urllib.error.URLError):
         return f"provider connection failed: {type(error.reason).__name__}"
+    if isinstance(error, subprocess.SubprocessError):
+        return f"media command failed: {type(error).__name__}"
+    if isinstance(error, OSError):
+        return f"filesystem operation failed: {type(error).__name__}"
     message = str(error)
     message = re.sub(r"https?://\S+", "[URL_REDACTED]", message)
     message = re.sub(
@@ -113,9 +158,30 @@ def safe_error(error: BaseException) -> str:
 
 
 def ensure_private_directory(path: Path) -> None:
+    if path.is_symlink():
+        raise CollectorError("refusing a symlinked managed directory")
     path.mkdir(parents=True, exist_ok=True)
+    if path.is_symlink() or not path.is_dir():
+        raise CollectorError("managed directory is not a real directory")
     if os.name == "posix":
-        path.chmod(0o700)
+        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            descriptor = os.open(path, flags)
+        except OSError as error:
+            raise CollectorError("could not safely open the managed directory") from error
+        try:
+            os.fchmod(descriptor, 0o700)
+        finally:
+            os.close(descriptor)
+
+
+def prepare_private_directory(path: Path) -> Path:
+    expected = path.resolve()
+    ensure_private_directory(path)
+    resolved = path.resolve()
+    if resolved != expected:
+        raise CollectorError("managed directory changed during validation")
+    return resolved
 
 
 def atomic_write(path: Path, data: bytes, mode: int = 0o600) -> None:
@@ -142,10 +208,29 @@ def validate_https_url(url: str, allowed_hosts: Iterable[str]) -> str:
     hostname = (parsed.hostname or "").lower()
     if parsed.scheme != "https" or not hostname:
         raise CollectorError("provider returned a non-HTTPS URL")
-    allowed = tuple(host.lower() for host in allowed_hosts)
-    if not any(hostname == host or hostname.endswith(host) for host in allowed):
+    allowed = tuple(host.lower().lstrip(".") for host in allowed_hosts)
+    if not any(
+        hostname == host or hostname.endswith(f".{host}") for host in allowed
+    ):
         raise CollectorError(f"provider returned an unapproved host: {hostname}")
     return url
+
+
+def build_opener(allowed_hosts: Iterable[str]) -> urllib.request.OpenerDirector:
+    return urllib.request.build_opener(AllowlistedRedirectHandler(allowed_hosts))
+
+
+def record_rate_limits(provider: str, headers: Any, stats: CacheStats) -> None:
+    normalized = {str(key).lower(): str(value) for key, value in headers.items()}
+    remaining = normalized.get("x-ratelimit-remaining")
+    reset = normalized.get("x-ratelimit-reset")
+    if remaining is not None:
+        try:
+            stats.rate_limit_remaining[provider] = int(remaining)
+        except ValueError:
+            pass
+    if reset:
+        stats.rate_limit_reset[provider] = reset[:80]
 
 
 def request_json(
@@ -168,28 +253,41 @@ def request_json(
             stats.hits += 1
             return json.loads(cache_path.read_text(encoding="utf-8"))
 
+    if stats.rate_limit_remaining.get(provider, 1) <= 0:
+        reset = stats.rate_limit_reset.get(provider, "the provider reset time")
+        raise CollectorError(f"{provider} API rate limit exhausted; retry after {reset}")
+
     stats.misses += 1
     request = urllib.request.Request(
         url,
         headers={"User-Agent": USER_AGENT, **(headers or {})},
     )
+    opener = build_opener(API_HOSTS)
     last_error: BaseException | None = None
     for attempt in range(3):
         try:
-            with urllib.request.urlopen(request, timeout=60) as response:
+            with opener.open(request, timeout=60) as response:
                 final_url = response.geturl()
                 validate_https_url(final_url, API_HOSTS)
                 raw = response.read(MAX_API_RESPONSE_BYTES + 1)
                 if len(raw) > MAX_API_RESPONSE_BYTES:
                     raise CollectorError("provider response exceeds the size limit")
                 payload = json.loads(raw.decode("utf-8"))
+                record_rate_limits(provider, response.headers, stats)
             atomic_write(cache_path, json.dumps(payload).encode("utf-8"))
             return payload
         except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError) as error:
             last_error = error
+            if isinstance(error, urllib.error.HTTPError) and error.code == 429:
+                retry_after = str(
+                    (error.headers or {}).get("Retry-After")
+                    or "the provider reset time"
+                )[:80]
+                raise CollectorError(
+                    f"{provider} API rate limit reached; retry after {retry_after}"
+                ) from error
             if isinstance(error, urllib.error.HTTPError) and error.code not in {
                 408,
-                429,
                 500,
                 502,
                 503,
@@ -220,6 +318,13 @@ def select_landscape_file(files: Iterable[dict[str, Any]]) -> dict[str, Any] | N
         reverse=True,
     )
     return options[0] if options else None
+
+
+def required_text(value: Any) -> str | None:
+    text = str(value).strip() if value is not None else ""
+    if not text or text.lower() in {"none", "null", "unknown", "n/a"}:
+        return None
+    return text
 
 
 def pexels_search(
@@ -256,18 +361,21 @@ def pexels_search(
         selected = select_landscape_file(video.get("video_files", []))
         if not selected:
             continue
+        source_id = required_text(video.get("id"))
+        source_page_value = required_text(video.get("url"))
+        creator = required_text((video.get("user") or {}).get("name"))
+        if not source_id or not source_page_value or not creator:
+            continue
         download_url = validate_https_url(
             str(selected.get("link")), DOWNLOAD_HOST_SUFFIXES["pexels"]
         )
+        source_page = validate_https_url(source_page_value, ("pexels.com",))
         rows.append(
             {
                 "provider": "pexels",
-                "source_id": str(video.get("id")),
-                "source_page": validate_https_url(
-                    str(video.get("url")), (".pexels.com",)
-                ),
-                "creator": (video.get("user") or {}).get("name")
-                or "Pexels contributor",
+                "source_id": source_id,
+                "source_page": source_page,
+                "creator": creator,
                 "_download_url": download_url,
                 "api_width": int(selected.get("width") or 0),
                 "api_height": int(selected.get("height") or 0),
@@ -319,17 +427,21 @@ def pixabay_search(
         )
         if not selected:
             continue
+        source_id = required_text(video.get("id"))
+        source_page_value = required_text(video.get("pageURL"))
+        creator = required_text(video.get("user"))
+        if not source_id or not source_page_value or not creator:
+            continue
         download_url = validate_https_url(
             str(selected.get("link")), DOWNLOAD_HOST_SUFFIXES["pixabay"]
         )
+        source_page = validate_https_url(source_page_value, ("pixabay.com",))
         rows.append(
             {
                 "provider": "pixabay",
-                "source_id": str(video.get("id")),
-                "source_page": validate_https_url(
-                    str(video.get("pageURL")), (".pixabay.com",)
-                ),
-                "creator": video.get("user") or "Pixabay contributor",
+                "source_id": source_id,
+                "source_page": source_page,
+                "creator": creator,
                 "_download_url": download_url,
                 "api_width": int(selected.get("width") or 0),
                 "api_height": int(selected.get("height") or 0),
@@ -376,24 +488,60 @@ def catalog_matches(
     return [row for _, row in scored[:limit]]
 
 
+def rights_complete(row: dict[str, Any]) -> bool:
+    return all(
+        required_text(row.get(key))
+        for key in (
+            "provider",
+            "source_id",
+            "source_page",
+            "creator",
+            "license",
+            "license_url",
+        )
+    )
+
+
+def ensure_within_root(path: Path, root: Path) -> Path:
+    resolved_root = root.resolve()
+    resolved_parent = path.parent.resolve()
+    if resolved_parent != resolved_root and resolved_root not in resolved_parent.parents:
+        raise CollectorError("output target escapes the configured output directory")
+    return path
+
+
+def ensure_private_subdirectory(path: Path, root: Path) -> None:
+    ensure_within_root(path, root)
+    if path.is_symlink():
+        raise CollectorError("refusing a symlinked output directory")
+    ensure_private_directory(path)
+    resolved_path = path.resolve()
+    resolved_root = root.resolve()
+    if resolved_path != resolved_root and resolved_root not in resolved_path.parents:
+        raise CollectorError("output directory escapes the configured output directory")
+
+
 def download(
     url: str,
     path: Path,
     provider: str,
     max_file_bytes: int,
+    output_root: Path,
 ) -> str:
     validate_https_url(url, DOWNLOAD_HOST_SUFFIXES[provider])
+    ensure_within_root(path, output_root)
     ensure_private_directory(path.parent)
     digest = hashlib.sha256()
     total = 0
     request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    opener = build_opener(DOWNLOAD_HOST_SUFFIXES[provider])
     temporary = tempfile.NamedTemporaryFile(
         dir=path.parent, prefix=".download-", suffix=".part", delete=False
     )
     temporary_path = Path(temporary.name)
     temporary.close()
     try:
-        with urllib.request.urlopen(request, timeout=300) as response:
+        with opener.open(request, timeout=300) as response:
             validate_https_url(response.geturl(), DOWNLOAD_HOST_SUFFIXES[provider])
             declared = int(response.headers.get("Content-Length") or 0)
             if declared and declared > max_file_bytes:
@@ -449,43 +597,58 @@ def probe(path: Path) -> dict[str, Any]:
     }
 
 
-def make_frames(video: Path, frame_dir: Path, stem: str, duration: float) -> list[Path]:
+def make_frames(
+    video: Path,
+    frame_dir: Path,
+    stem: str,
+    duration: float,
+    output_root: Path,
+) -> list[Path]:
+    ensure_within_root(frame_dir, output_root)
     ensure_private_directory(frame_dir)
     frames: list[Path] = []
-    for label, fraction in (("start", 0.2), ("middle", 0.5), ("end", 0.8)):
-        frame = frame_dir / f"{stem}-{label}.jpg"
-        with tempfile.NamedTemporaryFile(
-            dir=frame_dir, prefix=".frame-", suffix=".jpg", delete=False
-        ) as handle:
-            temporary_frame = Path(handle.name)
-        try:
-            subprocess.run(
-                [
-                    "ffmpeg",
-                    "-hide_banner",
-                    "-loglevel",
-                    "error",
-                    "-y",
-                    "-ss",
-                    f"{max(0.2, duration * fraction):.3f}",
-                    "-i",
-                    str(video),
-                    "-frames:v",
-                    "1",
-                    "-vf",
-                    "scale=640:-2",
-                    str(temporary_frame),
-                ],
-                check=True,
+    try:
+        for label, fraction in (("start", 0.2), ("middle", 0.5), ("end", 0.8)):
+            frame = ensure_within_root(
+                frame_dir / f"{stem}-{label}.jpg", output_root
             )
-            if os.name == "posix":
-                temporary_frame.chmod(0o600)
-            temporary_frame.replace(frame)
-        finally:
-            if temporary_frame.exists():
-                temporary_frame.unlink()
-        frames.append(frame)
-    return frames
+            with tempfile.NamedTemporaryFile(
+                dir=frame_dir, prefix=".frame-", suffix=".jpg", delete=False
+            ) as handle:
+                temporary_frame = Path(handle.name)
+            try:
+                subprocess.run(
+                    [
+                        "ffmpeg",
+                        "-hide_banner",
+                        "-loglevel",
+                        "error",
+                        "-y",
+                        "-ss",
+                        f"{max(0.2, duration * fraction):.3f}",
+                        "-i",
+                        str(video),
+                        "-frames:v",
+                        "1",
+                        "-vf",
+                        "scale=640:-2",
+                        str(temporary_frame),
+                    ],
+                    check=True,
+                )
+                if os.name == "posix":
+                    temporary_frame.chmod(0o600)
+                temporary_frame.replace(frame)
+            finally:
+                if temporary_frame.exists():
+                    temporary_frame.unlink()
+            frames.append(frame)
+        return frames
+    except (subprocess.SubprocessError, OSError):
+        for frame in frames:
+            if frame.is_symlink() or frame.is_file():
+                frame.unlink()
+        raise
 
 
 def dhash(path: Path) -> str:
@@ -493,7 +656,7 @@ def dhash(path: Path) -> str:
         image = ImageOps.exif_transpose(opened).convert("L").resize(
             (9, 8), Image.Resampling.LANCZOS
         )
-    pixels = list(image.getdata())
+    pixels = list(image.get_flattened_data())
     value = 0
     bit = 0
     for row in range(8):
@@ -551,6 +714,21 @@ def public_candidate(row: dict[str, Any]) -> dict[str, Any]:
         for key, value in row.items()
         if not key.startswith("_") and not SECRET_NAME_PATTERN.search(key)
     }
+
+
+def remove_generated(paths: Iterable[Path], root: Path) -> int:
+    removed = 0
+    resolved_root = root.resolve()
+    for path in paths:
+        resolved_parent = path.parent.resolve()
+        if resolved_parent != resolved_root and resolved_root not in resolved_parent.parents:
+            raise CollectorError(
+                "refusing to remove a generated file outside the output directory"
+            )
+        if path.is_symlink() or path.is_file():
+            path.unlink()
+            removed += 1
+    return removed
 
 
 def contact_sheet(rows: list[dict[str, Any]], output: Path) -> None:
@@ -636,26 +814,36 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         raise CollectorError("--dhash-threshold must stay within 0..16")
 
     queries = list(dict.fromkeys(validate_query(value) for value in args.query))
-    out = args.out.expanduser().resolve()
-    if out == Path(out.anchor) or out == Path.home().resolve():
+    if len(queries) > 50:
+        raise CollectorError("no more than 50 unique queries are allowed per run")
+    requested_out = args.out.expanduser()
+    expected_out = requested_out.resolve()
+    if expected_out == Path(expected_out.anchor) or expected_out == Path.home().resolve():
         raise CollectorError("refusing a broad output directory")
-    ensure_private_directory(out)
+    out = prepare_private_directory(requested_out)
     clips_dir, frames_dir = out / "clips", out / "frames"
-    cache_dir = (
-        args.cache_dir.expanduser().resolve()
+    requested_cache_dir = (
+        args.cache_dir.expanduser()
         if args.cache_dir
         else Path.home() / ".cache" / "rights-first-footage-collector"
     )
-    ensure_private_directory(cache_dir)
+    cache_dir = prepare_private_directory(requested_cache_dir)
     if args.download:
-        ensure_private_directory(clips_dir)
-        ensure_private_directory(frames_dir)
+        ensure_private_subdirectory(clips_dir, out)
+        ensure_private_subdirectory(frames_dir, out)
 
     env = load_env(args.env_file)
     catalog = load_catalog(args.catalog)
     local = {query: catalog_matches(catalog, query) for query in queries}
     unresolved = [query for query in queries if args.force_external or not local[query]]
     providers = ("pexels", "pixabay") if args.provider == "all" else (args.provider,)
+    if "pixabay" in providers and any(len(query) > 100 for query in unresolved):
+        raise CollectorError("Pixabay queries must be 100 characters or fewer")
+    effective_cache_ttl_hours = (
+        max(24, args.cache_ttl_hours)
+        if "pixabay" in providers
+        else args.cache_ttl_hours
+    )
     required_keys = {"pexels": "PEXELS_API_KEY", "pixabay": "PIXABAY_API_KEY"}
     if unresolved:
         missing = [required_keys[item] for item in providers if not env.get(required_keys[item])]
@@ -683,7 +871,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 args.limit_per_query,
                 env[required_keys[provider]],
                 cache_dir,
-                args.cache_ttl_hours,
+                effective_cache_ttl_hours,
                 cache_stats,
             )
             for row in found:
@@ -692,36 +880,44 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     continue
                 seen_source_ids.add(identity)
                 licence, licence_url = LICENSES[row["provider"]]
-                candidates.append(
-                    {
-                        **row,
-                        "query": query,
-                        "api_page": page,
-                        "license": licence,
-                        "license_url": licence_url,
-                        "status": (
-                            "REJECTED_CATALOG_SOURCE_DUPLICATE"
-                            if identity in catalog_source_ids
-                            else "CANDIDATE_NEEDS_REVIEW"
-                        ),
-                        "collected_at": utc_now(),
-                    }
-                )
+                candidate = {
+                    **row,
+                    "query": query,
+                    "api_page": page,
+                    "license": licence,
+                    "license_url": licence_url,
+                    "status": (
+                        "REJECTED_CATALOG_SOURCE_DUPLICATE"
+                        if identity in catalog_source_ids
+                        else "CANDIDATE_NEEDS_REVIEW"
+                    ),
+                    "collected_at": utc_now(),
+                }
+                if rights_complete(candidate):
+                    candidates.append(candidate)
 
     downloaded: list[dict[str, Any]] = []
     seen_sha256: set[str] = set()
     seen_visuals: list[list[str]] = []
     max_bytes = args.max_file_mb * 1024 * 1024
+    download_attempts = 0
+    rejected_files_removed = 0
     for index, row in enumerate(candidates):
-        if not args.download or len(downloaded) >= args.max_downloads:
+        if not args.download or download_attempts >= args.max_downloads:
             break
         if row["status"] != "CANDIDATE_NEEDS_REVIEW":
             continue
-        stem = f"{index + 1:02d}-{slugify(row['query'])}-{row['provider']}-{row['source_id']}"
-        video = clips_dir / f"{stem}.mp4"
+        source_component = safe_source_component(str(row["source_id"]))
+        stem = (
+            f"{index + 1:02d}-{slugify(row['query'])}-"
+            f"{row['provider']}-{source_component}"
+        )
+        video = ensure_within_root(clips_dir / f"{stem}.mp4", out)
+        frames: list[Path] = []
+        download_attempts += 1
         try:
             sha256 = download(
-                row["_download_url"], video, row["provider"], max_bytes
+                row["_download_url"], video, row["provider"], max_bytes, out
             )
             media = probe(video)
             if (
@@ -731,8 +927,12 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 or media["width"] <= media["height"]
             ):
                 row["status"] = "REJECTED_TECHNICAL"
+                rejected_files_removed += remove_generated([video], out)
+                row["rejected_files_removed"] = True
                 continue
-            frames = make_frames(video, frames_dir, stem, media["duration_sec"])
+            frames = make_frames(
+                video, frames_dir, stem, media["duration_sec"], out
+            )
             visual_hashes = [dhash(frame) for frame in frames]
             duplicate = (
                 sha256 in seen_sha256
@@ -754,6 +954,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             )
             if duplicate:
                 row["status"] = "REJECTED_DUPLICATE"
+                rejected_files_removed += remove_generated([video, *frames], out)
+                row.pop("file", None)
+                row.pop("review_frames", None)
+                row["rejected_files_removed"] = True
                 continue
             seen_sha256.add(sha256)
             seen_visuals.append(visual_hashes)
@@ -761,6 +965,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         except (CollectorError, subprocess.SubprocessError, OSError, ValueError) as error:
             row["status"] = "REJECTED_DOWNLOAD_OR_PROBE"
             row["error"] = safe_error(error)
+            rejected_files_removed += remove_generated([video, *frames], out)
+            row["rejected_files_removed"] = True
 
     manifest = out / "candidate_manifest.jsonl"
     public_rows = [public_candidate(row) for row in candidates]
@@ -783,11 +989,16 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "local_catalog_matches": {query: len(rows) for query, rows in local.items()},
         "external_queries": len(unresolved),
         "candidates": len(candidates),
+        "download_attempts": download_attempts,
         "downloaded": len(downloaded),
+        "rejected_files_removed": rejected_files_removed,
         "cache_hits": cache_stats.hits,
         "cache_misses": cache_stats.misses,
-        "manifest": str(manifest),
-        "contact_sheet": str(sheet_path) if public_downloaded else None,
+        "cache_ttl_hours": effective_cache_ttl_hours,
+        "rate_limit_remaining": cache_stats.rate_limit_remaining,
+        "rate_limit_reset": cache_stats.rate_limit_reset,
+        "manifest": manifest.name,
+        "contact_sheet": sheet_path.name if public_downloaded else None,
         "catalog_modified": False,
         "download_urls_in_manifest": False,
         "private_cache_may_contain_provider_download_urls": True,
