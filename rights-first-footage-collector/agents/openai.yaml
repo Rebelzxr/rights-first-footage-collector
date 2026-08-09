@@ -1,0 +1,4 @@
+interface:
+  display_name: "Rights-First Footage Collector"
+  short_description: "Find and receipt licensed footage safely"
+  default_prompt: "Use $rights-first-footage-collector to find licensed footage candidates, reject duplicates, and create a review manifest and contact sheet."

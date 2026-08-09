@@ -1,0 +1,30 @@
+name: Feature request
+description: Propose a bounded improvement or official provider integration
+title: "[Feature]: "
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What recurring problem would this solve?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behaviour
+    validations:
+      required: true
+  - type: textarea
+    id: rights
+    attributes:
+      label: Rights and API evidence
+      description: For a provider, link its official API, licence and rate-limit documentation.
+  - type: checkboxes
+    id: boundaries
+    attributes:
+      label: Boundaries
+      options:
+        - label: This proposal does not require scraping social platforms or bypassing provider limits.
+          required: true

@@ -1,0 +1,43 @@
+name: Bug report
+description: Report a reproducible collector failure without exposing credentials or media
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: "Remove API keys, signed URLs, personal paths, provider caches and downloaded media before submitting."
+  - type: input
+    id: version
+    attributes:
+      label: Version or commit
+      placeholder: commit SHA or release
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: Environment
+      placeholder: macOS 15, Python 3.11, ffmpeg 7
+    validations:
+      required: true
+  - type: textarea
+    id: behaviour
+    attributes:
+      label: What happened?
+      description: Include the redacted error and expected behaviour.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Minimal reproduction
+      description: Replace credentials, URLs and personal paths with placeholders.
+    validations:
+      required: true
+  - type: checkboxes
+    id: safety
+    attributes:
+      label: Safety check
+      options:
+        - label: I removed secrets, signed URLs, downloaded footage and private catalog data.
+          required: true
