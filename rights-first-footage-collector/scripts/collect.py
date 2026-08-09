@@ -145,6 +145,8 @@ def safe_error(error: BaseException) -> str:
         return f"provider connection failed: {type(error.reason).__name__}"
     if isinstance(error, subprocess.SubprocessError):
         return f"media command failed: {type(error).__name__}"
+    if isinstance(error, OSError):
+        return f"filesystem operation failed: {type(error).__name__}"
     message = str(error)
     message = re.sub(r"https?://\S+", "[URL_REDACTED]", message)
     message = re.sub(

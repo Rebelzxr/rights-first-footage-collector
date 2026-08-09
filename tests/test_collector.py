@@ -66,6 +66,14 @@ class CollectorTests(unittest.TestCase):
         self.assertNotIn("abc123", message)
         self.assertNotIn("https://", message)
         self.assertIn("[REDACTED]", message)
+        subprocess_message = MODULE.safe_error(
+            subprocess.CalledProcessError(
+                1, ["/" + "Users" + "/example/private/ffmpeg"]
+            )
+        )
+        self.assertEqual(
+            subprocess_message, "media command failed: CalledProcessError"
+        )
 
     def test_safe_http_error_omits_url(self) -> None:
         error = urllib.error.HTTPError(
@@ -510,13 +518,7 @@ class CollectorTests(unittest.TestCase):
             def fake_download(_url, path, _provider, _max_bytes, output_root):
                 captured.append((path, output_root))
                 MODULE.ensure_within_root(path, output_root)
-                raise subprocess.CalledProcessError(
-                    1,
-                    [
-                        personal_root + "/ffmpeg",
-                        personal_root + "/video.mp4",
-                    ],
-                )
+                raise OSError(13, "Permission denied", personal_root + "/frame.jpg")
 
             MODULE.pexels_search = fake_search
             MODULE.download = fake_download
@@ -556,7 +558,7 @@ class CollectorTests(unittest.TestCase):
                 encoding="utf-8"
             )
             self.assertNotIn(personal_root, manifest)
-            self.assertIn("media command failed: CalledProcessError", manifest)
+            self.assertIn("filesystem operation failed: PermissionError", manifest)
 
     def test_download_cap_counts_failed_attempts(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
