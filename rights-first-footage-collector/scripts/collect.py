@@ -71,14 +71,15 @@ class AllowlistedRedirectHandler(urllib.request.HTTPRedirectHandler):
         headers: Any,
         new_url: str,
     ) -> urllib.request.Request | None:
-        validate_https_url(new_url, self.allowed_hosts)
+        absolute_url = urllib.parse.urljoin(request.full_url, new_url)
+        validate_https_url(absolute_url, self.allowed_hosts)
         redirected = super().redirect_request(
-            request, file_pointer, code, message, headers, new_url
+            request, file_pointer, code, message, headers, absolute_url
         )
         if redirected is None:
             return None
         old_host = (urllib.parse.urlsplit(request.full_url).hostname or "").lower()
-        new_host = (urllib.parse.urlsplit(new_url).hostname or "").lower()
+        new_host = (urllib.parse.urlsplit(absolute_url).hostname or "").lower()
         if old_host != new_host:
             for name in ("Authorization", "Proxy-Authorization"):
                 redirected.remove_header(name)
@@ -94,6 +95,12 @@ def utc_now() -> str:
 def slugify(value: str) -> str:
     slug = re.sub(r"[^a-z0-9]+", "-", value.lower()).strip("-")
     return slug[:72] or "footage"
+
+
+def safe_source_component(value: str) -> str:
+    readable = slugify(value)[:40]
+    digest = hashlib.sha256(value.encode("utf-8")).hexdigest()[:12]
+    return f"{readable}-{digest}"
 
 
 def validate_query(value: str) -> str:
@@ -214,15 +221,16 @@ def request_json(
     stats: CacheStats,
 ) -> dict[str, Any]:
     validate_https_url(url, API_HOSTS)
-    if stats.rate_limit_remaining.get(provider, 1) <= 0:
-        reset = stats.rate_limit_reset.get(provider, "the provider reset time")
-        raise CollectorError(f"{provider} API rate limit exhausted; retry after {reset}")
     cache_path = cache_dir / f"{cache_key(provider, query, page, limit)}.json"
     if cache_path.is_file() and not cache_path.is_symlink():
         age = time.time() - cache_path.stat().st_mtime
         if age <= cache_ttl_hours * 3600:
             stats.hits += 1
             return json.loads(cache_path.read_text(encoding="utf-8"))
+
+    if stats.rate_limit_remaining.get(provider, 1) <= 0:
+        reset = stats.rate_limit_reset.get(provider, "the provider reset time")
+        raise CollectorError(f"{provider} API rate limit exhausted; retry after {reset}")
 
     stats.misses += 1
     request = urllib.request.Request(
@@ -469,13 +477,23 @@ def rights_complete(row: dict[str, Any]) -> bool:
     )
 
 
+def ensure_within_root(path: Path, root: Path) -> Path:
+    resolved_root = root.resolve()
+    resolved_parent = path.parent.resolve()
+    if resolved_parent != resolved_root and resolved_root not in resolved_parent.parents:
+        raise CollectorError("output target escapes the configured output directory")
+    return path
+
+
 def download(
     url: str,
     path: Path,
     provider: str,
     max_file_bytes: int,
+    output_root: Path,
 ) -> str:
     validate_https_url(url, DOWNLOAD_HOST_SUFFIXES[provider])
+    ensure_within_root(path, output_root)
     ensure_private_directory(path.parent)
     digest = hashlib.sha256()
     total = 0
@@ -543,12 +561,21 @@ def probe(path: Path) -> dict[str, Any]:
     }
 
 
-def make_frames(video: Path, frame_dir: Path, stem: str, duration: float) -> list[Path]:
+def make_frames(
+    video: Path,
+    frame_dir: Path,
+    stem: str,
+    duration: float,
+    output_root: Path,
+) -> list[Path]:
+    ensure_within_root(frame_dir, output_root)
     ensure_private_directory(frame_dir)
     frames: list[Path] = []
     try:
         for label, fraction in (("start", 0.2), ("middle", 0.5), ("end", 0.8)):
-            frame = frame_dir / f"{stem}-{label}.jpg"
+            frame = ensure_within_root(
+                frame_dir / f"{stem}-{label}.jpg", output_root
+            )
             with tempfile.NamedTemporaryFile(
                 dir=frame_dir, prefix=".frame-", suffix=".jpg", delete=False
             ) as handle:
@@ -773,6 +800,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     local = {query: catalog_matches(catalog, query) for query in queries}
     unresolved = [query for query in queries if args.force_external or not local[query]]
     providers = ("pexels", "pixabay") if args.provider == "all" else (args.provider,)
+    if "pixabay" in providers and any(len(query) > 100 for query in unresolved):
+        raise CollectorError("Pixabay queries must be 100 characters or fewer")
     effective_cache_ttl_hours = (
         max(24, args.cache_ttl_hours)
         if "pixabay" in providers
@@ -841,13 +870,17 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             break
         if row["status"] != "CANDIDATE_NEEDS_REVIEW":
             continue
-        stem = f"{index + 1:02d}-{slugify(row['query'])}-{row['provider']}-{row['source_id']}"
-        video = clips_dir / f"{stem}.mp4"
+        source_component = safe_source_component(str(row["source_id"]))
+        stem = (
+            f"{index + 1:02d}-{slugify(row['query'])}-"
+            f"{row['provider']}-{source_component}"
+        )
+        video = ensure_within_root(clips_dir / f"{stem}.mp4", out)
         frames: list[Path] = []
         download_attempts += 1
         try:
             sha256 = download(
-                row["_download_url"], video, row["provider"], max_bytes
+                row["_download_url"], video, row["provider"], max_bytes, out
             )
             media = probe(video)
             if (
@@ -860,7 +893,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 rejected_files_removed += remove_generated([video], out)
                 row["rejected_files_removed"] = True
                 continue
-            frames = make_frames(video, frames_dir, stem, media["duration_sec"])
+            frames = make_frames(
+                video, frames_dir, stem, media["duration_sec"], out
+            )
             visual_hashes = [dhash(frame) for frame in frames]
             duplicate = (
                 sha256 in seen_sha256
