@@ -173,6 +173,15 @@ def ensure_private_directory(path: Path) -> None:
             os.close(descriptor)
 
 
+def prepare_private_directory(path: Path) -> Path:
+    expected = path.resolve()
+    ensure_private_directory(path)
+    resolved = path.resolve()
+    if resolved != expected:
+        raise CollectorError("managed directory changed during validation")
+    return resolved
+
+
 def atomic_write(path: Path, data: bytes, mode: int = 0o600) -> None:
     ensure_private_directory(path.parent)
     with tempfile.NamedTemporaryFile(dir=path.parent, delete=False) as handle:
@@ -805,17 +814,18 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     queries = list(dict.fromkeys(validate_query(value) for value in args.query))
     if len(queries) > 50:
         raise CollectorError("no more than 50 unique queries are allowed per run")
-    out = args.out.expanduser().resolve()
-    if out == Path(out.anchor) or out == Path.home().resolve():
+    requested_out = args.out.expanduser()
+    expected_out = requested_out.resolve()
+    if expected_out == Path(expected_out.anchor) or expected_out == Path.home().resolve():
         raise CollectorError("refusing a broad output directory")
-    ensure_private_directory(out)
+    out = prepare_private_directory(requested_out)
     clips_dir, frames_dir = out / "clips", out / "frames"
-    cache_dir = (
-        args.cache_dir.expanduser().resolve()
+    requested_cache_dir = (
+        args.cache_dir.expanduser()
         if args.cache_dir
         else Path.home() / ".cache" / "rights-first-footage-collector"
     )
-    ensure_private_directory(cache_dir)
+    cache_dir = prepare_private_directory(requested_cache_dir)
     if args.download:
         ensure_private_subdirectory(clips_dir, out)
         ensure_private_subdirectory(frames_dir, out)

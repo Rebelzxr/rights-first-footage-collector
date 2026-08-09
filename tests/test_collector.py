@@ -204,6 +204,70 @@ class CollectorTests(unittest.TestCase):
             self.assertEqual(stat.S_IMODE(external.stat().st_mode), 0o755)
             self.assertEqual(list(external.iterdir()), [])
 
+    @unittest.skipUnless(os.name == "posix", "POSIX permission and symlink test")
+    def test_symlinked_top_level_output_is_rejected_without_external_writes(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            external = root / "external"
+            external.mkdir()
+            external.chmod(0o755)
+            output_link = root / "output-link"
+            output_link.symlink_to(external, target_is_directory=True)
+            args = Namespace(
+                query=["stone arch"],
+                provider="pexels",
+                out=output_link,
+                env_file=None,
+                catalog=None,
+                cache_dir=root / "cache",
+                cache_ttl_hours=24,
+                limit_per_query=1,
+                max_downloads=1,
+                max_file_mb=10,
+                page_start=1,
+                dhash_threshold=6,
+                download=False,
+                force_external=False,
+            )
+
+            with self.assertRaisesRegex(MODULE.CollectorError, "symlinked"):
+                MODULE.run(args)
+
+            self.assertEqual(stat.S_IMODE(external.stat().st_mode), 0o755)
+            self.assertEqual(list(external.iterdir()), [])
+
+    @unittest.skipUnless(os.name == "posix", "POSIX permission and symlink test")
+    def test_symlinked_cache_directory_is_rejected_without_external_writes(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            external = root / "external-cache"
+            external.mkdir()
+            external.chmod(0o755)
+            cache_link = root / "cache-link"
+            cache_link.symlink_to(external, target_is_directory=True)
+            args = Namespace(
+                query=["stone arch"],
+                provider="pexels",
+                out=root / "output",
+                env_file=None,
+                catalog=None,
+                cache_dir=cache_link,
+                cache_ttl_hours=24,
+                limit_per_query=1,
+                max_downloads=1,
+                max_file_mb=10,
+                page_start=1,
+                dhash_threshold=6,
+                download=False,
+                force_external=False,
+            )
+
+            with self.assertRaisesRegex(MODULE.CollectorError, "symlinked"):
+                MODULE.run(args)
+
+            self.assertEqual(stat.S_IMODE(external.stat().st_mode), 0o755)
+            self.assertEqual(list(external.iterdir()), [])
+
     def test_expired_cache_is_not_fresh(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
             cache_path = Path(folder) / "cache.json"
