@@ -4,6 +4,7 @@ import importlib.util
 import json
 import os
 import stat
+import subprocess
 import sys
 import tempfile
 import time
@@ -185,6 +186,23 @@ class CollectorTests(unittest.TestCase):
             self.assertEqual(MODULE.ensure_within_root(safe, root), safe)
             with self.assertRaisesRegex(MODULE.CollectorError, "escapes"):
                 MODULE.ensure_within_root(root.parent / "escape.mp4", root)
+
+    @unittest.skipUnless(os.name == "posix", "POSIX permission and symlink test")
+    def test_symlinked_output_directory_does_not_mutate_external_target(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            output = root / "output"
+            external = root / "external"
+            output.mkdir()
+            external.mkdir()
+            external.chmod(0o755)
+            (output / "clips").symlink_to(external, target_is_directory=True)
+
+            with self.assertRaisesRegex(MODULE.CollectorError, "symlinked"):
+                MODULE.ensure_private_subdirectory(output / "clips", output)
+
+            self.assertEqual(stat.S_IMODE(external.stat().st_mode), 0o755)
+            self.assertEqual(list(external.iterdir()), [])
 
     def test_expired_cache_is_not_fresh(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
@@ -406,6 +424,7 @@ class CollectorTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
             captured: list[tuple[Path, Path]] = []
+            personal_root = "/" + "Users" + "/example/private"
             original_search = MODULE.pexels_search
             original_download = MODULE.download
             old_key = os.environ.get("PEXELS_API_KEY")
@@ -427,7 +446,13 @@ class CollectorTests(unittest.TestCase):
             def fake_download(_url, path, _provider, _max_bytes, output_root):
                 captured.append((path, output_root))
                 MODULE.ensure_within_root(path, output_root)
-                raise MODULE.CollectorError("stop after path validation")
+                raise subprocess.CalledProcessError(
+                    1,
+                    [
+                        personal_root + "/ffmpeg",
+                        personal_root + "/video.mp4",
+                    ],
+                )
 
             MODULE.pexels_search = fake_search
             MODULE.download = fake_download
@@ -463,6 +488,11 @@ class CollectorTests(unittest.TestCase):
             self.assertNotIn("/", path.name)
             self.assertNotIn("\\", path.name)
             self.assertNotIn("..", path.name)
+            manifest = (root / "out" / "candidate_manifest.jsonl").read_text(
+                encoding="utf-8"
+            )
+            self.assertNotIn(personal_root, manifest)
+            self.assertIn("media command failed: CalledProcessError", manifest)
 
     def test_download_cap_counts_failed_attempts(self) -> None:
         with tempfile.TemporaryDirectory() as folder:

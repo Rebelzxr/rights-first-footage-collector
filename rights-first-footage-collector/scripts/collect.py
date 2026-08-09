@@ -143,6 +143,8 @@ def safe_error(error: BaseException) -> str:
         return f"provider request failed with HTTP {error.code}"
     if isinstance(error, urllib.error.URLError):
         return f"provider connection failed: {type(error.reason).__name__}"
+    if isinstance(error, subprocess.SubprocessError):
+        return f"media command failed: {type(error).__name__}"
     message = str(error)
     message = re.sub(r"https?://\S+", "[URL_REDACTED]", message)
     message = re.sub(
@@ -154,9 +156,21 @@ def safe_error(error: BaseException) -> str:
 
 
 def ensure_private_directory(path: Path) -> None:
+    if path.is_symlink():
+        raise CollectorError("refusing a symlinked managed directory")
     path.mkdir(parents=True, exist_ok=True)
+    if path.is_symlink() or not path.is_dir():
+        raise CollectorError("managed directory is not a real directory")
     if os.name == "posix":
-        path.chmod(0o700)
+        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            descriptor = os.open(path, flags)
+        except OSError as error:
+            raise CollectorError("could not safely open the managed directory") from error
+        try:
+            os.fchmod(descriptor, 0o700)
+        finally:
+            os.close(descriptor)
 
 
 def atomic_write(path: Path, data: bytes, mode: int = 0o600) -> None:
@@ -485,6 +499,17 @@ def ensure_within_root(path: Path, root: Path) -> Path:
     return path
 
 
+def ensure_private_subdirectory(path: Path, root: Path) -> None:
+    ensure_within_root(path, root)
+    if path.is_symlink():
+        raise CollectorError("refusing a symlinked output directory")
+    ensure_private_directory(path)
+    resolved_path = path.resolve()
+    resolved_root = root.resolve()
+    if resolved_path != resolved_root and resolved_root not in resolved_path.parents:
+        raise CollectorError("output directory escapes the configured output directory")
+
+
 def download(
     url: str,
     path: Path,
@@ -792,8 +817,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     )
     ensure_private_directory(cache_dir)
     if args.download:
-        ensure_private_directory(clips_dir)
-        ensure_private_directory(frames_dir)
+        ensure_private_subdirectory(clips_dir, out)
+        ensure_private_subdirectory(frames_dir, out)
 
     env = load_env(args.env_file)
     catalog = load_catalog(args.catalog)
